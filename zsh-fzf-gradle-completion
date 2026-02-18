@@ -1,0 +1,153 @@
+# --- Gradle task completion via fzf on TAB -----------------------------------
+
+# Requirements:
+#  - fzf installed
+#  - ~/.gradle/gradle-tasks.sh executable
+#    Usage: ~/.gradle/gradle-tasks.sh <projectDir>
+#    Output: one task per line
+
+# Config
+: ${GRADLE_FZF_TASKS_SCRIPT:="$HOME/.gradle/gradle-tasks.sh"}
+: ${GRADLE_FZF_CACHE_DIR:="${XDG_CACHE_HOME:-$HOME/.cache}/gradle-fzf"}
+: ${GRADLE_FZF_CACHE_TTL_SECONDS:=120}   # refresh every 2 minutes by default
+
+# Internal helpers
+_gradle_fzf__is_gradle_buffer() {
+  # Trigger when line starts with "gradle " or "./gradlew " or "gradlew "
+  [[ "$LBUFFER" == gradle\ * || "$LBUFFER" == ./gradlew\ * || "$LBUFFER" == gradlew\ * ]]
+}
+
+_gradle_fzf__project_dir() {
+  # Decide project directory based on current directory (simple + robust)
+  # You can make this smarter (e.g., walk up to find settings.gradle) if you want.
+  print -r -- "$PWD"
+}
+
+_gradle_fzf__cache_key() {
+  # Key by absolute project directory (hashed) so different projects don't collide
+  local dir="$1"
+  local key
+  key="$(print -r -- "$dir" | command shasum -a 256 2>/dev/null | awk '{print $1}')"
+  [[ -z "$key" ]] && key="$(print -r -- "$dir" | command openssl dgst -sha256 2>/dev/null | awk '{print $2}')"
+  [[ -z "$key" ]] && key="${dir//\//_}"  # last resort
+  print -r -- "$key"
+}
+
+_gradle_fzf__cache_paths() {
+  local dir="$1"
+  local key="$(_gradle_fzf__cache_key "$dir")"
+  local base="${GRADLE_FZF_CACHE_DIR}/${key}"
+  print -r -- "${base}.tasks" "${base}.ts" "${base}.lock"
+}
+
+_gradle_fzf__now() { date +%s }
+
+_gradle_fzf__cache_is_fresh() {
+  local tasks_file="$1" ts_file="$2"
+  [[ -s "$tasks_file" && -f "$ts_file" ]] || return 1
+  local last now
+  last="$(<"$ts_file" 2>/dev/null)" || return 1
+  now="$(_gradle_fzf__now)"
+  (( now - last < GRADLE_FZF_CACHE_TTL_SECONDS ))
+}
+
+_gradle_fzf__refresh_cache_async() {
+  local project_dir="$1"
+  local tasks_file="$2" ts_file="$3" lock_file="$4"
+
+  # Avoid multiple refreshes: use mkdir lock (atomic)
+  if command mkdir "$lock_file" 2>/dev/null; then
+    (
+      # Ensure lock is removed even on failures
+      trap 'rmdir "$lock_file" 2>/dev/null' EXIT
+
+      # Fetch tasks; write to temp then atomically replace
+      local tmp="${tasks_file}.$$"
+      if [[ -x "$GRADLE_FZF_TASKS_SCRIPT" ]]; then
+        "$GRADLE_FZF_TASKS_SCRIPT" "$project_dir" >| "$tmp" 2>/dev/null
+      else
+        print -r -- "ERROR: $GRADLE_FZF_TASKS_SCRIPT not executable" >| "$tmp"
+      fi
+
+      # Keep only non-empty lines, unique, stable order
+      command awk 'NF{print}' "$tmp" | command awk '!seen[$0]++' >| "$tasks_file".new 2>/dev/null
+      command mv -f "$tasks_file".new "$tasks_file" 2>/dev/null
+      command rm -f "$tmp" 2>/dev/null
+
+      _gradle_fzf__now >| "$ts_file" 2>/dev/null
+    ) &!
+  fi
+}
+
+_gradle_fzf__ensure_cache() {
+  local project_dir="$1"
+  local tasks_file="$2" ts_file="$3" lock_file="$4"
+
+  command mkdir -p "$GRADLE_FZF_CACHE_DIR" 2>/dev/null
+
+  # If cache is fresh, do nothing. If not, refresh in background.
+  if ! _gradle_fzf__cache_is_fresh "$tasks_file" "$ts_file"; then
+    _gradle_fzf__refresh_cache_async "$project_dir" "$tasks_file" "$ts_file" "$lock_file"
+  fi
+
+  # If tasks file doesn't exist yet (first run), do a foreground fetch so user can pick now.
+  if [[ ! -s "$tasks_file" ]]; then
+    if [[ -x "$GRADLE_FZF_TASKS_SCRIPT" ]]; then
+      local tmp="${tasks_file}.$$"
+      "$GRADLE_FZF_TASKS_SCRIPT" "$project_dir" >| "$tmp" 2>/dev/null
+      command awk 'NF{print}' "$tmp" | command awk '!seen[$0]++' >| "$tasks_file" 2>/dev/null
+      command rm -f "$tmp" 2>/dev/null
+      _gradle_fzf__now >| "$ts_file" 2>/dev/null
+    fi
+  fi
+}
+
+_gradle_fzf__insert_task() {
+  local task="$1"
+  [[ -n "$task" ]] || return 1
+
+  # If cursor is right after "gradle " / "./gradlew " / "gradlew ", just append.
+  # Otherwise ensure there's a space before inserting.
+  if [[ "$LBUFFER" != *[[:space:]] ]]; then
+    LBUFFER+=" "
+  fi
+  LBUFFER+="$task"
+}
+
+# The TAB widget
+_gradle_fzf_complete_widget() {
+  if ! _gradle_fzf__is_gradle_buffer; then
+    zle expand-or-complete
+    return
+  fi
+
+  local project_dir tasks_file ts_file lock_file
+  project_dir="$(_gradle_fzf__project_dir)"
+  read -r tasks_file ts_file lock_file <<<"$(_gradle_fzf__cache_paths "$project_dir")"
+
+  _gradle_fzf__ensure_cache "$project_dir" "$tasks_file" "$ts_file" "$lock_file"
+
+  if [[ ! -s "$tasks_file" ]]; then
+    zle -M "No tasks found (or tasks script failed)."
+    return
+  fi
+
+  local prompt="Gradle task> "
+  local header="Project: ${project_dir}  •  Enter=insert  •  Ctrl-R=refresh"
+  local selected
+
+  # Open fzf. Ctrl-R forces refresh (foreground) then reload list.
+  selected="$(
+    FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS:-} --height=40% --layout=reverse --prompt=${prompt:q} --header=${header:q}" \
+    fzf --bind "ctrl-r:execute-silent($GRADLE_FZF_TASKS_SCRIPT ${(q)project_dir} >| ${(q)tasks_file} && date +%s >| ${(q)ts_file})+reload(awk 'NF{print}' ${(q)tasks_file})" \
+        < <(awk 'NF{print}' "$tasks_file")
+  )" || return
+
+  _gradle_fzf__insert_task "$selected"
+  zle redisplay
+}
+
+zle -N _gradle_fzf_complete_widget
+bindkey '^I' _gradle_fzf_complete_widget
+
+# ---------------------------------------------------------------------------
