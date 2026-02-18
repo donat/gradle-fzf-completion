@@ -1,153 +1,565 @@
 # --- Gradle task completion via fzf on TAB -----------------------------------
+# Dependencies
+# - zsh
+#   - This script must be sourced by zsh and uses ZLE widgets and ${(z)} word splitting.
+#
+# - fzf (must support `--listen`)
+#   - Unix domain socket mode requires fzf >= 0.66.0 (pass a path ending in `.sock`).
+#   - Older versions require TCP mode (`--listen 127.0.0.1:<port>`).
+#   - The refresh feature depends on pushing actions to the running instance (e.g. `reload(...)`, `change-header(...)`).
+#
+# - curl >= 7.40.0
+#   - Requires `--unix-socket` so the background refresh can POST actions to the fzf Unix socket.
+#
+# Specification
+#
+# Overview
+# - Provides an fzf-based completion UI on TAB for Gradle wrapper invocations.
+# - Activates only when the current directory is the Gradle root (./gradlew exists and is executable).
+#
+# Logging
+# - Writes log events to `.gradle-completion/log.txt`, relative to the project root directory.
+# - Creates `.gradle-completion/` and `log.txt` if they do not exist.
+# - Appends one line per event.
+# - Uses the format: `<timestamp> <event> [<metadata>]`.
+# - Uses a local timestamp formatted like `YYYY-MM-DDTHH:MM:SS+ZZZZ`.
+# - Omits the `[<metadata>]` block when there is no metadata.
+# - Encodes metadata as a single string (commonly key=value pairs).
+#
+# Activation
+# - Activates when the left buffer (text before the cursor) begins with `gradlew` or `./gradlew`.
+# - Activates only when `./gradlew` is present in the current directory and is executable.
+# - Uses TAB as the activation key.
+# - Falls back to the shell’s default completion (`expand-or-complete`) when not activated.
+#
+# Candidate source and caching
+# - Reads candidates from `.gradle-completion/cached-entries.txt`.
+# - Treats each line in the file as one completion candidate.
+# - Logs `initial_content_loaded` when candidates are loaded.
+# - Sets `source=cache` in the `initial_content_loaded` metadata when the cache file already exists.
+# - Runs `initialize.sh <rootDir>` when the cache file does not exist.
+# - Logs `initialize` before running `initialize.sh`.
+# - Writes the stdout of `initialize.sh` to `.gradle-completion/cached-entries.txt`.
+# - Loads candidates from the newly written cache file after initialization.
+# - Logs `initial_content_loaded` with `source=initialize` after loading from the newly created cache.
+# - Logs `initialize_failed` with `exit=<code>` when `initialize.sh` exits non-zero.
+# - Leaves the prompt unchanged when initialization fails.
+#
+# Refresh
+# - Supports refreshing the cache while the fzf UI is open.
+# - The user triggers a refresh by pressing Ctrl+R.
+# - Runs `refresh.sh <rootDir>` in the background (non-blocking).
+# - While refresh is running:
+#   - The existing candidate list remains usable.
+#   - The header shows a refresh-in-progress indicator.
+# - When refresh completes:
+#   - If successful, atomically replaces `.gradle-completion/cached-entries.txt` with the refreshed output.
+#   - If failed, leaves the existing cache file unchanged.
+#   - Clears the refresh-in-progress indicator in the UI header.
+#   - Updates the fzf candidate list immediately (without requiring additional user interaction) by sending actions to the running fzf instance via `--listen` (Unix socket).
+# - Ignores additional Ctrl+R presses while a refresh is already running.
+#
+# Expectations on refresh.sh
+# - Same as initialize.sh, but may take longer.
+# - Accepts exactly one argument: the Gradle project root directory.
+# - Prints one completion candidate per line to stdout.
+# - Prints any errors to stderr.
+# - Exits with a non-zero status on failure.
+#
+# Refresh logging
+# - Logs `refresh_requested` when the user presses Ctrl+R.
+# - Logs `refresh_started` when the background refresh begins.
+# - Logs `refresh_skipped` with `reason=already_running` when Ctrl+R is pressed during an in-flight refresh.
+# - Logs `refresh_finished` with `exit=0` when refresh succeeds.
+# - Logs `refresh_failed` with `exit=<code>` when refresh exits non-zero.
+#
+# Expectations on initialize.sh
+# - Accepts exactly one argument: the Gradle project root directory.
+# - Assumes the directory is a valid Gradle wrapper project.
+# - Prints one completion candidate per line to stdout.
+# - Prints any errors to stderr.
+# - Exits with a non-zero status on failure.
+#
+# User interaction behavior
+# - Opens an fzf selection UI populated with the candidate list.
+# - Treats Ctrl+C and Esc in the fzf UI as cancellation.
+# - Restores the original prompt on cancellation.
+# - Logs `user_cancelled` when the user cancels the UI.
+# - Sets `via=esc` when the user cancels with Escape, and `via=ctrl-c` when the user cancels with Ctrl+C.
+# - If the cursor is immediately after a non-whitespace character AND there is at least one argument already present (i.e. the buffer contains more than just the `gradlew`/`./gradlew` command), the last argument token is treated as an initial filter for the fzf list.
+# - In that case, fzf starts with the filter pre-filled, and accepting a completion REPLACES the last argument token (does not append).
+# - Example: when the prompt is `./gradlew he` and the user accepts `help`, the result becomes `./gradlew help`.
+# - Otherwise (cursor after whitespace, or no arguments yet), accepting a completion APPENDS it to the prompt.
+# - When appending, inserts a single separating space before the appended completion when the prompt does not already end in whitespace.
+# - Shows a header line in the UI containing the current project directory and the cancellation hint.
+# - Header format (idle): `<projectDir>  |  Cancel: Esc/Ctrl+c  |  Refresh: Ctrl+r`.
+# - Header format (refreshing): `<projectDir>  |  Cancel: Esc/Ctrl+c  |  Refresh: Ctrl+r  |  Refreshing...`.
 
-# Requirements:
-#  - fzf installed
-#  - ~/.gradle/gradle-tasks.sh executable
-#    Usage: ~/.gradle/gradle-tasks.sh <projectDir>
-#    Output: one task per line
+# --- Implementation ----------------------------------------------------------
 
-# Config
-: ${GRADLE_FZF_TASKS_SCRIPT:="$HOME/.gradle/gradle-tasks.sh"}
-: ${GRADLE_FZF_CACHE_DIR:="${XDG_CACHE_HOME:-$HOME/.cache}/gradle-fzf"}
-: ${GRADLE_FZF_CACHE_TTL_SECONDS:=120}   # refresh every 2 minutes by default
+# Guard: this script is intended to be sourced from zsh.
+if [[ -z ${ZSH_VERSION:-} ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
-# Internal helpers
-_gradle_fzf__is_gradle_buffer() {
-  # Trigger when line starts with "gradle " or "./gradlew " or "gradlew "
-  [[ "$LBUFFER" == gradle\ * || "$LBUFFER" == ./gradlew\ * || "$LBUFFER" == gradlew\ * ]]
+# Resolve the directory of this sourced script (works when sourced).
+# ${(%):-%x} expands to the current sourced file in zsh.
+__gradle_fzf_completion__script_path=${${(%):-%x}:A}
+__gradle_fzf_completion__script_dir=${__gradle_fzf_completion__script_path:h}
+
+# Utilities
+__gradle_fzf_completion__now() {
+  # ISO-8601-ish local timestamp
+  date "+%Y-%m-%dT%H:%M:%S%z"
 }
 
-_gradle_fzf__project_dir() {
-  # Decide project directory based on current directory (simple + robust)
-  # You can make this smarter (e.g., walk up to find settings.gradle) if you want.
-  print -r -- "$PWD"
+__gradle_fzf_completion__ensure_log_file() {
+  local root_dir="$1"
+  local log_dir="$root_dir/.gradle-completion"
+  local log_file="$log_dir/log.txt"
+  mkdir -p "$log_dir" 2>/dev/null
+  : >| "$log_file" 2>/dev/null || true
 }
 
-_gradle_fzf__cache_key() {
-  # Key by absolute project directory (hashed) so different projects don't collide
-  local dir="$1"
-  local key
-  key="$(print -r -- "$dir" | command shasum -a 256 2>/dev/null | awk '{print $1}')"
-  [[ -z "$key" ]] && key="$(print -r -- "$dir" | command openssl dgst -sha256 2>/dev/null | awk '{print $2}')"
-  [[ -z "$key" ]] && key="${dir//\//_}"  # last resort
-  print -r -- "$key"
+__gradle_fzf_completion__log() {
+  local root_dir="$1"
+  local event="$2"
+  local metadata="$3"
+
+  __gradle_fzf_completion__ensure_log_file "$root_dir"
+  local log_file="$root_dir/.gradle-completion/log.txt"
+
+  if [[ -n "$metadata" ]]; then
+    print -r -- "$(__gradle_fzf_completion__now) $event [$metadata]" >>| "$log_file" 2>/dev/null || true
+  else
+    print -r -- "$(__gradle_fzf_completion__now) $event" >>| "$log_file" 2>/dev/null || true
+  fi
 }
 
-_gradle_fzf__cache_paths() {
-  local dir="$1"
-  local key="$(_gradle_fzf__cache_key "$dir")"
-  local base="${GRADLE_FZF_CACHE_DIR}/${key}"
-  print -r -- "${base}.tasks" "${base}.ts" "${base}.lock"
+__gradle_fzf_completion__is_gradle_root() {
+  # Must be in a directory that contains an executable Gradle wrapper script
+  [[ -x "./gradlew" && -f "./gradlew" ]]
 }
 
-_gradle_fzf__now() { date +%s }
-
-_gradle_fzf__cache_is_fresh() {
-  local tasks_file="$1" ts_file="$2"
-  [[ -s "$tasks_file" && -f "$ts_file" ]] || return 1
-  local last now
-  last="$(<"$ts_file" 2>/dev/null)" || return 1
-  now="$(_gradle_fzf__now)"
-  (( now - last < GRADLE_FZF_CACHE_TTL_SECONDS ))
+__gradle_fzf_completion__should_activate() {
+  # Trigger only when the left buffer begins with `gradlew` or `./gradlew`
+  local lb="$LBUFFER"
+  [[ "$lb" == gradlew* || "$lb" == "./gradlew"* ]]
 }
 
-_gradle_fzf__refresh_cache_async() {
-  local project_dir="$1"
-  local tasks_file="$2" ts_file="$3" lock_file="$4"
+__gradle_fzf_completion__fzf_supports_unix_socket_listen() {
+  # Unix socket support for --listen was added in fzf 0.66.0.
+  local v
+  v="$(fzf --version 2>/dev/null | awk '{print $1}')"
+  [[ -n "$v" ]] || return 1
 
-  # Avoid multiple refreshes: use mkdir lock (atomic)
-  if command mkdir "$lock_file" 2>/dev/null; then
-    (
-      # Ensure lock is removed even on failures
-      trap 'rmdir "$lock_file" 2>/dev/null' EXIT
+  local major="${v%%.*}"
+  local rest="${v#*.}"
+  local minor="${rest%%.*}"
+  local patch="${rest#*.}"
+  patch="${patch%%[^0-9]*}"
 
-      # Fetch tasks; write to temp then atomically replace
-      local tmp="${tasks_file}.$$"
-      if [[ -x "$GRADLE_FZF_TASKS_SCRIPT" ]]; then
-        "$GRADLE_FZF_TASKS_SCRIPT" "$project_dir" >| "$tmp" 2>/dev/null
-      else
-        print -r -- "ERROR: $GRADLE_FZF_TASKS_SCRIPT not executable" >| "$tmp"
+  [[ "$major" == <-> && "$minor" == <-> && "$patch" == <-> ]] || return 1
+
+  # >= 0.66.0
+  if (( major > 0 )); then
+    return 0
+  fi
+  if (( minor > 66 )); then
+    return 0
+  fi
+  if (( minor < 66 )); then
+    return 1
+  fi
+  (( patch >= 0 ))
+}
+
+__gradle_fzf_completion__pick_listen_port() {
+  # Best-effort random high port on localhost.
+  print -r -- $(( 49152 + (RANDOM % 16383) ))
+}
+
+__gradle_fzf_completion__cached_entries_file() {
+  print -r -- "$1/.gradle-completion/cached-entries.txt"
+}
+
+__gradle_fzf_completion__refresh_pid_file() {
+  print -r -- "$1/.gradle-completion/refresh.pid"
+}
+
+__gradle_fzf_completion__refresh_tmp_file() {
+  print -r -- "$1/.gradle-completion/cached-entries.txt.refresh.tmp"
+}
+
+__gradle_fzf_completion__refresh_script() {
+  # Prefer a refresh.sh next to this completion script, otherwise rely on PATH.
+  local script="$__gradle_fzf_completion__script_dir/refresh.sh"
+  if [[ -x "$script" ]]; then
+    print -r -- "$script"
+  else
+    print -r -- "refresh.sh"
+  fi
+}
+
+__gradle_fzf_completion__is_refresh_running() {
+  local root_dir="$1"
+  local pid_file="$(__gradle_fzf_completion__refresh_pid_file "$root_dir")"
+  if [[ ! -r "$pid_file" ]]; then
+    return 1
+  fi
+  local pid
+  pid="$(cat -- "$pid_file" 2>/dev/null)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# Updated to use listen_target (can be .sock or TCP addr)
+__gradle_fzf_completion__start_refresh_background() {
+  local root_dir="$1"
+  local listen_target="$2"
+  local header_idle="$3"
+
+  mkdir -p "$root_dir/.gradle-completion" 2>/dev/null
+
+  if __gradle_fzf_completion__is_refresh_running "$root_dir"; then
+    __gradle_fzf_completion__log "$root_dir" "refresh_skipped" "reason=already_running"
+    return 0
+  fi
+
+  local refresh_script
+  refresh_script="$(__gradle_fzf_completion__refresh_script)"
+  __gradle_fzf_completion__log "$root_dir" "refresh_started" "script=$refresh_script"
+
+  local cache_file tmp_file pid_file
+  cache_file="$(__gradle_fzf_completion__cached_entries_file "$root_dir")"
+  tmp_file="$(__gradle_fzf_completion__refresh_tmp_file "$root_dir")"
+  pid_file="$(__gradle_fzf_completion__refresh_pid_file "$root_dir")"
+
+  (
+    local rc
+    local out
+
+    if ! out="$($refresh_script "$root_dir" 2> >(cat 1>&2))"; then
+      rc=$?
+      rm -f -- "$tmp_file" 2>/dev/null || true
+      rm -f -- "$pid_file" 2>/dev/null || true
+      __gradle_fzf_completion__log "$root_dir" "refresh_failed" "exit=$rc"
+      if [[ -n "$listen_target" && -n "$header_idle" ]]; then
+        __gradle_fzf_completion__fzf_post_action "$listen_target" "change-header($header_idle)"
       fi
-
-      # Keep only non-empty lines, unique, stable order
-      command awk 'NF{print}' "$tmp" | command awk '!seen[$0]++' >| "$tasks_file".new 2>/dev/null
-      command mv -f "$tasks_file".new "$tasks_file" 2>/dev/null
-      command rm -f "$tmp" 2>/dev/null
-
-      _gradle_fzf__now >| "$ts_file" 2>/dev/null
-    ) &!
-  fi
-}
-
-_gradle_fzf__ensure_cache() {
-  local project_dir="$1"
-  local tasks_file="$2" ts_file="$3" lock_file="$4"
-
-  command mkdir -p "$GRADLE_FZF_CACHE_DIR" 2>/dev/null
-
-  # If cache is fresh, do nothing. If not, refresh in background.
-  if ! _gradle_fzf__cache_is_fresh "$tasks_file" "$ts_file"; then
-    _gradle_fzf__refresh_cache_async "$project_dir" "$tasks_file" "$ts_file" "$lock_file"
-  fi
-
-  # If tasks file doesn't exist yet (first run), do a foreground fetch so user can pick now.
-  if [[ ! -s "$tasks_file" ]]; then
-    if [[ -x "$GRADLE_FZF_TASKS_SCRIPT" ]]; then
-      local tmp="${tasks_file}.$$"
-      "$GRADLE_FZF_TASKS_SCRIPT" "$project_dir" >| "$tmp" 2>/dev/null
-      command awk 'NF{print}' "$tmp" | command awk '!seen[$0]++' >| "$tasks_file" 2>/dev/null
-      command rm -f "$tmp" 2>/dev/null
-      _gradle_fzf__now >| "$ts_file" 2>/dev/null
+      exit 0
     fi
+
+    print -r -- "$out" >| "$tmp_file"
+    mv -f -- "$tmp_file" "$cache_file" 2>/dev/null || cp -f -- "$tmp_file" "$cache_file"
+    rm -f -- "$tmp_file" 2>/dev/null || true
+    rm -f -- "$pid_file" 2>/dev/null || true
+    if [[ -n "$listen_target" ]]; then
+      __gradle_fzf_completion__fzf_post_action "$listen_target" "reload(cat -- \"$cache_file\")"
+    fi
+    if [[ -n "$listen_target" && -n "$header_idle" ]]; then
+      __gradle_fzf_completion__fzf_post_action "$listen_target" "change-header($header_idle)"
+    fi
+    __gradle_fzf_completion__log "$root_dir" "refresh_finished" "exit=0"
+    exit 0
+  ) &!
+
+  # Record background PID so the UI can report progress.
+  print -r -- "$!" >| "$pid_file" 2>/dev/null || true
+}
+# Send an action string to a running fzf instance started with --listen.
+# If listen_target ends with .sock: use Unix domain socket.
+# Otherwise treat it as TCP address (e.g. 127.0.0.1:6266).
+__gradle_fzf_completion__fzf_post_action() {
+  local listen_target="$1"
+  local action="$2"
+
+  [[ -n "$listen_target" ]] || return 0
+
+  if [[ "$listen_target" == *.sock ]]; then
+    [[ -S "$listen_target" ]] || return 0
+    command curl --silent --show-error --fail --unix-socket "$listen_target" http -d "$action" >/dev/null 2>&1 || true
+  else
+    command curl --silent --show-error --fail "http://$listen_target" -d "$action" >/dev/null 2>&1 || true
   fi
 }
 
-_gradle_fzf__insert_task() {
-  local task="$1"
-  [[ -n "$task" ]] || return 1
+__gradle_fzf_completion__print_candidates() {
+  # Prints current candidates from the cache file.
+  local root_dir="$1"
+  local cache_file="$(__gradle_fzf_completion__cached_entries_file "$root_dir")"
+  if [[ -r "$cache_file" ]]; then
+    cat -- "$cache_file"
+  fi
+}
 
-  # If cursor is right after "gradle " / "./gradlew " / "gradlew ", just append.
-  # Otherwise ensure there's a space before inserting.
-  if [[ "$LBUFFER" != *[[:space:]] ]]; then
+__gradle_fzf_completion__header_idle() {
+  local root_dir="$1"
+  print -r -- "$root_dir  |  Cancel: Esc/Ctrl+c  |  Refresh: Ctrl+r"
+}
+
+__gradle_fzf_completion__header_refreshing() {
+  local root_dir="$1"
+  print -r -- "$root_dir  |  Cancel: Esc/Ctrl+c  |  Refresh: Ctrl+r  |  Refreshing..."
+}
+
+__gradle_fzf_completion__on_refresh_key() {
+  local root_dir="$1"
+  local listen_target="$2"
+  local header_idle="$3"
+
+  __gradle_fzf_completion__log "$root_dir" "refresh_requested" "via=ctrl-r"
+  __gradle_fzf_completion__start_refresh_background "$root_dir" "$listen_target" "$header_idle"
+}
+
+__gradle_fzf_completion__initialize_entries() {
+  local root_dir="$1"
+  local cache_file="$(__gradle_fzf_completion__cached_entries_file "$root_dir")"
+
+  mkdir -p "$root_dir/.gradle-completion" 2>/dev/null
+
+  # Prefer an initialize.sh next to this completion script, otherwise rely on PATH.
+  local init_script="$__gradle_fzf_completion__script_dir/initialize.sh"
+  if [[ ! -x "$init_script" ]]; then
+    init_script="initialize.sh"
+  fi
+
+  __gradle_fzf_completion__log "$root_dir" "initialize" "script=$init_script"
+
+  # Run initializer and cache its output.
+  local out
+  if ! out="$("$init_script" "$root_dir" 2> >(cat 1>&2))"; then
+    local rc=$?
+    __gradle_fzf_completion__log "$root_dir" "initialize_failed" "exit=$rc"
+    return $rc
+  fi
+
+  # Write output exactly as lines; trim any empty final line(s) is OK.
+  print -r -- "$out" >| "$cache_file"
+  return 0
+}
+
+__gradle_fzf_completion__load_entries() {
+  local root_dir="$1"
+  local cache_file="$(__gradle_fzf_completion__cached_entries_file "$root_dir")"
+
+  if [[ -r "$cache_file" ]]; then
+    __gradle_fzf_completion__log "$root_dir" "initial_content_loaded" "source=cache"
+    cat -- "$cache_file"
+    return 0
+  fi
+
+  if ! __gradle_fzf_completion__initialize_entries "$root_dir"; then
+    return $?
+  fi
+
+  __gradle_fzf_completion__log "$root_dir" "initial_content_loaded" "source=initialize"
+  cat -- "$cache_file"
+}
+
+__gradle_fzf_completion__append_to_lbuffer() {
+  local text="$1"
+  if [[ -z "$text" ]]; then
+    return 0
+  fi
+
+  # Add a separating space unless the buffer is empty or already ends with whitespace.
+  if [[ -n "$LBUFFER" && "$LBUFFER" != *[[:space:]] ]]; then
     LBUFFER+=" "
   fi
-  LBUFFER+="$task"
+  LBUFFER+="$text"
 }
 
-# The TAB widget
-_gradle_fzf_complete_widget() {
-  if ! _gradle_fzf__is_gradle_buffer; then
+__gradle_fzf_completion__compute_filter_and_prefix() {
+  # Prints three lines:
+  # 1) mode: "append" or "replace"
+  # 2) prefix: the part of LBUFFER to keep (may be empty)
+  # 3) filter: the initial filter text (may be empty)
+
+  local lb="$LBUFFER"
+
+  # If the buffer ends with whitespace, we are in append mode.
+  if [[ -z "$lb" || "$lb" == *[[:space:]] ]]; then
+    print -r -- "append"
+    print -r -- "$lb"
+    print -r -- ""
+    return 0
+  fi
+
+  # Determine how many shell words are in the buffer.
+  local -a words
+  words=(${(z)lb})
+
+  # If there's only the command word (no arguments yet), do not treat it as a filter.
+  if (( ${#words} <= 1 )); then
+    print -r -- "append"
+    print -r -- "$lb"
+    print -r -- ""
+    return 0
+  fi
+
+  # Otherwise, treat the last token as an initial filter and replace it on acceptance.
+  local filter prefix
+  filter="$words[-1]"
+
+  # Keep everything before the last token as the prefix (this normally includes the separating whitespace).
+  prefix="${lb%$filter}"
+
+  # Safety: ensure the prefix ends with whitespace so that replacement does not glue tokens together.
+  if [[ -n "$prefix" && "$prefix" != *[[:space:]] ]]; then
+    prefix+=" "
+  fi
+
+  print -r -- "replace"
+  print -r -- "$prefix"
+  print -r -- "$filter"
+}
+
+# Main ZLE widget
+__gradle_fzf_completion__widget() {
+  # Only handle our cases; otherwise fall back to normal completion.
+  if ! __gradle_fzf_completion__should_activate || ! __gradle_fzf_completion__is_gradle_root; then
     zle expand-or-complete
-    return
+    return 0
   fi
 
-  local project_dir tasks_file ts_file lock_file
-  project_dir="$(_gradle_fzf__project_dir)"
-  read -r tasks_file ts_file lock_file <<<"$(_gradle_fzf__cache_paths "$project_dir")"
+  local root_dir="$PWD"
 
-  _gradle_fzf__ensure_cache "$project_dir" "$tasks_file" "$ts_file" "$lock_file"
+  local mode prefix filter
+  {
+    local -a parts
+    parts=(${(@f)$(__gradle_fzf_completion__compute_filter_and_prefix)})
+    mode="$parts[1]"
+    prefix="$parts[2]"
+    filter="$parts[3]"
+  }
 
-  if [[ ! -s "$tasks_file" ]]; then
-    zle -M "No tasks found (or tasks script failed)."
-    return
+  # Load candidates
+  local entries
+  if ! entries="$(__gradle_fzf_completion__load_entries "$root_dir")"; then
+    # Initializer failed; do not modify prompt.
+    return $?
   fi
 
-  local prompt="Gradle task> "
-  local header="Project: ${project_dir}  •  Enter=insert  •  Ctrl-R=refresh"
-  local selected
+  # No entries -> do nothing
+  if [[ -z "$entries" ]]; then
+    return 0
+  fi
 
-  # Open fzf. Ctrl-R forces refresh (foreground) then reload list.
-  selected="$(
-    FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS:-} --height=40% --layout=reverse --prompt=${prompt:q} --header=${header:q}" \
-    fzf --bind "ctrl-r:execute-silent($GRADLE_FZF_TASKS_SCRIPT ${(q)project_dir} >| ${(q)tasks_file} && date +%s >| ${(q)ts_file})+reload(awk 'NF{print}' ${(q)tasks_file})" \
-        < <(awk 'NF{print}' "$tasks_file")
-  )" || return
+  local header_idle header_refreshing
+  header_idle="$(__gradle_fzf_completion__header_idle "$root_dir")"
+  header_refreshing="$(__gradle_fzf_completion__header_refreshing "$root_dir")"
 
-  _gradle_fzf__insert_task "$selected"
+  local cache_file pid_file self_script
+  cache_file="$(__gradle_fzf_completion__cached_entries_file "$root_dir")"
+  pid_file="$(__gradle_fzf_completion__refresh_pid_file "$root_dir")"
+  self_script="$__gradle_fzf_completion__script_path"
+
+  local listen_target listen_arg cleanup_listen
+  cleanup_listen=""
+
+  if __gradle_fzf_completion__fzf_supports_unix_socket_listen; then
+    local fzf_sock
+    fzf_sock="$root_dir/.gradle-completion/fzf-${$}-${RANDOM}.sock"
+    rm -f -- "$fzf_sock" 2>/dev/null || true
+    listen_target="$fzf_sock"
+    listen_arg="$fzf_sock"
+    cleanup_listen="$fzf_sock"
+  else
+    local port
+    port="$(__gradle_fzf_completion__pick_listen_port)"
+    listen_target="127.0.0.1:$port"
+    listen_arg="$listen_target"
+  fi
+
+  local initial_header
+  if __gradle_fzf_completion__is_refresh_running "$root_dir"; then
+    initial_header="$header_refreshing"
+  else
+    initial_header="$header_idle"
+  fi
+
+  # Ctrl+R starts an async refresh; header shows progress and list reloads.
+  # Note: fzf executes bind commands via /bin/sh, so we must not reference shell functions directly.
+  local bind_refresh
+  bind_refresh="ctrl-r:execute-silent(zsh -lc 'source \"$self_script\"; __gradle_fzf_completion__on_refresh_key \"$root_dir\" \"$listen_target\" \"$header_idle\"')+change-header($header_refreshing)"
+
+  # Run fzf; Escape / Ctrl+C should cancel and restore prompt.
+  local out key selected
+
+  if [[ -n "$filter" ]]; then
+    out=$(cat -- "$cache_file" 2>/dev/null | fzf \
+      --no-multi \
+      --height=40% \
+      --reverse \
+      --prompt="Gradle> " \
+      --header="$initial_header" \
+      --listen="$listen_arg" \
+      --query="$filter" \
+      --expect=esc,ctrl-c \
+      --bind=ctrl-c:abort \
+      --bind="$bind_refresh")
+  else
+    out=$(cat -- "$cache_file" 2>/dev/null | fzf \
+      --no-multi \
+      --height=40% \
+      --reverse \
+      --prompt="Gradle> " \
+      --header="$initial_header" \
+      --listen="$listen_arg" \
+      --expect=esc,ctrl-c \
+      --bind=ctrl-c:abort \
+      --bind="$bind_refresh")
+  fi
+  local rc=$?
+
+  if [[ -n "$cleanup_listen" ]]; then
+    rm -f -- "$cleanup_listen" 2>/dev/null || true
+  fi
+
+  # When using --expect, the first line is the pressed key (or empty), the second line is the selection.
+  key="${out%%$'\n'*}"
+  selected="${out#*$'\n'}"
+  if [[ "$out" != *$'\n'* ]]; then
+    # Single-line output: no key captured, treat it as the selection.
+    key=""
+    selected="$out"
+  fi
+
+  # Cancellation: distinguish ESC vs Ctrl+C when possible.
+  if [[ "$key" == "esc" || "$key" == "ctrl-c" ]]; then
+    __gradle_fzf_completion__log "$root_dir" "user_cancelled" "via=$key"
+    zle redisplay
+    return 0
+  fi
+
+  # Fallback cancellation paths (fzf aborts or errors).
+  if (( rc == 130 )); then
+    __gradle_fzf_completion__log "$root_dir" "user_cancelled" "via=ctrl-c"
+    zle redisplay
+    return 0
+  fi
+
+  if (( rc != 0 )) || [[ -z "$selected" ]]; then
+    # Any non-zero or empty selection: do nothing.
+    return 0
+  fi
+
+  if [[ "$mode" == "replace" ]]; then
+    # Replace the last argument token (used as initial filter).
+    # Ensure a space between the command/prefix and the selected token.
+    local p="$prefix"
+    if [[ -n "$p" && "$p" != *[[:space:]] ]]; then
+      p+=" "
+    fi
+    LBUFFER="$p$selected"
+  else
+    __gradle_fzf_completion__append_to_lbuffer "$selected"
+  fi
+  __gradle_fzf_completion__log "$root_dir" "completion_accepted" "selection=$selected"
   zle redisplay
 }
 
-zle -N _gradle_fzf_complete_widget
-bindkey '^I' _gradle_fzf_complete_widget
-
-# ---------------------------------------------------------------------------
+# Register widget and bind TAB.
+zle -N __gradle_fzf_completion__widget
+bindkey '^I' __gradle_fzf_completion__widget
