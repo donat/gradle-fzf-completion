@@ -24,16 +24,20 @@ jobs:
         run: |
           set -euo pipefail
           archive="fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz"
+          out="${RUNNER_TEMP}/${archive}"
 
           # Create an archive from the repository root, excluding hidden files/dirs (dotfiles) anywhere.
           # Examples excluded: .git, .github, .env, any ".*" under subdirectories.
+          # Write the tarball outside the checkout to avoid "file changed as we read it".
           tar \
             --exclude='./.*' \
             --exclude='*/.*' \
-            -czf "$archive" \
+            -czf "$out" \
             .
+
+          echo "ARCHIVE_PATH=$out" >> "$GITHUB_ENV"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ github.workspace }}/fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz
+          files: ${{ env.ARCHIVE_PATH }}
