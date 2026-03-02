@@ -12,11 +12,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        os: [linux, darwin]
-        arch: [amd64, arm64]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,11 +20,20 @@ jobs:
         id: vars
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Package tar.gz
+      - name: Package tar.gz (non-hidden files only)
         run: |
-          tar -czf fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz .
+          set -euo pipefail
+          archive="fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz"
+
+          # Create an archive from the repository root, excluding hidden files/dirs (dotfiles) anywhere.
+          # Examples excluded: .git, .github, .env, any ".*" under subdirectories.
+          tar \
+            --exclude='./.*' \
+            --exclude='*/.*' \
+            -czf "$archive" \
+            .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz
+          files: ${{ github.workspace }}/fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz
