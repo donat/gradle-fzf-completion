@@ -27,7 +27,6 @@ jobs:
 
       - name: Package tar.gz
         run: |
-          cd dist
           tar -czf fzf_gradle_completion_${{ steps.vars.outputs.VERSION }}.tar.gz .
 
       - name: Create GitHub Release
